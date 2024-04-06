@@ -78,6 +78,13 @@ spu_cc_library(
     ],
 )
 
+spu_cc_library(
+    name = "utils",
+    srcs = ["utils.cc"],
+    hdrs = ["utils.h"],
+    deps = [":arith_comm"],
+)
+
 spu_cc_test(
     name = "matmat_prot_test",
     srcs = ["matmat_prot_test.cc"],
@@ -118,4 +125,10 @@ spu_cc_test(
         "//libspu/mpc/utils:ring_ops",
         "//libspu/mpc/utils:simulate",
     ],
+)
+
+spu_cc_test(
+    name = "utils_test",
+    srcs = ["utils_test.cc"],
+    deps = [":utils"],
 )
