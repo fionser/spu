@@ -36,7 +36,7 @@ class BasicOTProtocols {
   NdArrayRef RandBits(FieldType filed, const Shape &shape);
 
   // NOTE(lwj): compute the B2A(b) and output to the specified ring
-  // Require: input is 1-bit boolean and 1 <= bit_width < k.
+  // Require: input is 1-bit boolean and 1 <= bit_width <= k.
   NdArrayRef B2ASingleBitWithSize(const NdArrayRef &inp, int bit_width);
 
   // msg * select for select \in {0, 1}
