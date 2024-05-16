@@ -76,7 +76,7 @@ NdArrayRef BasicOTProtocols::PackedB2A(const NdArrayRef &inp) {
 
   const int64_t n = inp.numel();
   auto rand_bits = DISPATCH_ALL_FIELDS(field, "single_b2a", [&]() {
-    if ((n * inp.elsize()) & 7) {
+    if ((n * inp.elsize()) & 7 or (nbits & 7)) {
       // The SseTranspose requires the #columns is multiple of 8
       // Thus, we call the less efficient RandBits.
       return RandBits(field, {static_cast<int64_t>(nbits)});
