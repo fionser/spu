@@ -114,12 +114,10 @@ class MPCCKKSEncoder {
     slots_ = degree / 2;
     int logn = std::log2(degree);
 
-    // InitFFTMatrix(slots_);
-
     matrix_reps_index_map_.resize(degree);
 
-    // Copy from the matrix to the value vectors
-    uint64_t gen = 3;
+    // NOTE(lwj): change SEAL's generator to 5.
+    uint64_t gen = 5;
     uint64_t pos = 1;
     uint64_t m = static_cast<uint64_t>(degree) << 1;
     for (size_t i = 0; i < slots_; i++) {
@@ -143,9 +141,6 @@ class MPCCKKSEncoder {
     root_powers_.resize(degree);
     inv_root_powers_.resize(degree);
 
-    c64_root_powers_.resize(degree);
-    c64_inv_root_powers_.resize(degree);
-
     seal::util::ComplexRoots complex_roots(static_cast<size_t>(m),
                                            seal::MemoryManager::GetPool());
 
@@ -160,39 +155,10 @@ class MPCCKKSEncoder {
 
       inv_root_powers_[i].real(EncodeToFxp<scalar_t>(inv_rp.real(), fxp_));
       inv_root_powers_[i].imag(EncodeToFxp<scalar_t>(inv_rp.imag(), fxp_));
-
-      c64_root_powers_[i] = rp;
-      c64_inv_root_powers_[i] = inv_rp;
     }
 
     mpc_arith_ = MPCArith(fxp_);
     fft_handler_ = FFTHandler(mpc_arith_);
-
-    c64_arith_ = ComplexArith();
-    c64_fft_handler_ = C64_FFTHandler(c64_arith_);
-  }
-
-  void encode(absl::Span<const double> input,
-              absl::Span<double> destination) const {
-    const size_t n = slots_ * 2;
-    SPU_ENFORCE_EQ(input.size(), slots_);
-    SPU_ENFORCE_EQ(destination.size(), n);
-
-    auto conj_values = seal::util::allocate<std::complex<double>>(
-        n, seal::MemoryManager::GetPool(), 0);
-
-    for (size_t i = 0; i < input.size(); i++) {
-      conj_values[matrix_reps_index_map_[i]] = input[i];
-
-      conj_values[matrix_reps_index_map_[i + slots_]] = std::conj(input[i]);
-    }
-
-    double fix = 1. / static_cast<double>(n);
-    c64_fft_handler_.transform_from_rev(conj_values.get(),
-                                        seal::util::get_power_of_two(n),
-                                        c64_inv_root_powers_.data(), &fix);
-    std::transform(conj_values.get(), conj_values.get() + n, destination.data(),
-                   [](const auto& x) -> double { return x.real(); });
   }
 
   void encode(absl::Span<const scalar_t> input,
@@ -214,6 +180,29 @@ class MPCCKKSEncoder {
     }
   }
 
+  void decode_complex(absl::Span<const scalar_t> input,
+                      absl::Span<scalar_t> real_dest,
+                      absl::Span<scalar_t> imag_dest) const {
+    const size_t n = slots_ * 2;
+    SPU_ENFORCE_EQ(input.size(), n);
+    SPU_ENFORCE_EQ(real_dest.size(), slots_);
+    SPU_ENFORCE_EQ(imag_dest.size(), slots_);
+
+    auto res =
+        seal::util::allocate<value_t>(n, seal::MemoryManager::GetPool(), 0);
+    for (size_t i = 0; i < n; ++i) {
+      res[i].real(input[i]);
+    }
+
+    fft_handler_.transform_to_rev(res.get(), seal::util::get_power_of_two(n),
+                                  root_powers_.data());
+    for (size_t i = 0; i < slots_; i++) {
+      real_dest[i] = res[matrix_reps_index_map_[i]].real();
+      auto t = res[matrix_reps_index_map_[i]].imag();
+      imag_dest[i] = t;  // NOTE(lwj): not sure why this work
+    }
+  }
+
   void decode(absl::Span<const scalar_t> input,
               absl::Span<scalar_t> destination) const {
     const size_t n = slots_ * 2;
@@ -231,15 +220,6 @@ class MPCCKKSEncoder {
     for (size_t i = 0; i < slots_; i++) {
       destination[i] = res[matrix_reps_index_map_[i]].real();
     }
-    // for (size_t i = 0; i < slots_; ++i) {
-    //   scalar_t real_accum = 0;
-    //   scalar_t imag_accum = 0;
-    //   for (size_t j = 0; j < slots_; ++j) {
-    //     real_accum += fwd_mat_real_.at(i * slots_ + j) * input[j];
-    //     imag_accum += fwd_mat_imag_.at(i * slots_ + j) * input[slots_ + j];
-    //   }
-    //   destination[i] = real_accum - imag_accum;
-    // }
   }
 
   inline size_t slot_count() const noexcept { return slots_; }
@@ -253,9 +233,4 @@ class MPCCKKSEncoder {
   std::vector<root_t> inv_root_powers_;
   MPCArith mpc_arith_;
   FFTHandler fft_handler_;
-
-  std::vector<std::complex<double>> c64_root_powers_;
-  std::vector<std::complex<double>> c64_inv_root_powers_;
-  ComplexArith c64_arith_;
-  C64_FFTHandler c64_fft_handler_;
 };

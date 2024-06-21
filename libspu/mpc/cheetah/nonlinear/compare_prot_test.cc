@@ -42,7 +42,7 @@ INSTANTIATE_TEST_SUITE_P(
 
 TEST_P(CompareProtTest, Compare) {
   size_t kWorldSize = 2;
-  Shape shape = {13, 2, 3};
+  Shape shape = {1L << 17};
   FieldType field = std::get<0>(GetParam());
   size_t radix = std::get<2>(GetParam());
   bool greater_than = std::get<1>(GetParam());
@@ -67,10 +67,13 @@ TEST_P(CompareProtTest, Compare) {
   utils::simulate(kWorldSize, [&](std::shared_ptr<yacl::link::Context> ctx) {
     auto conn = std::make_shared<Communicator>(ctx);
     int rank = ctx->Rank();
-    auto base = std::make_shared<BasicOTProtocols>(
-        conn, CheetahOtKind::YACL_Softspoken);
+    auto base =
+        std::make_shared<BasicOTProtocols>(conn, CheetahOtKind::YACL_Ferret);
     CompareProtocol comp_prot(base, radix);
+    size_t sent = ctx->GetStats()->sent_bytes;
     auto _c = comp_prot.Compute(inp[rank], greater_than);
+    sent = ctx->GetStats()->sent_bytes - sent;
+    printf("Compare %f bits per\n", sent * 8.0 / shape.numel());
     cmp_oup[rank] = _c;
   });
 
@@ -93,12 +96,12 @@ TEST_P(CompareProtTest, CompareBitWidth) {
   FieldType field = std::get<0>(GetParam());
   size_t radix = std::get<2>(GetParam());
   bool greater_than = std::get<1>(GetParam());
-  int64_t bw = std::min<int>(32, SizeOf(field) * 8);
+  int64_t bw = SizeOf(field) * 8 - 7;
 
   NdArrayRef inp[2];
-  int64_t n = 100;
-  inp[0] = ring_rand(field, {n, 2});
-  inp[1] = ring_rand(field, {n, 2});
+  int64_t n = 1L << 16;
+  inp[0] = ring_rand(field, {n});
+  inp[1] = ring_rand(field, {n});
 
   DISPATCH_ALL_FIELDS(field, "", [&]() {
     ring2k_t mask = (static_cast<ring2k_t>(1) << bw) - 1;
@@ -115,15 +118,15 @@ TEST_P(CompareProtTest, CompareBitWidth) {
     pforeach(0, inp[0].numel(), [&](int64_t i) { xinp[i] &= mask; });
   });
 
-  inp[0] = inp[0].reshape({n, 2});
-  inp[1] = inp[1].reshape({n, 2});
+  inp[0] = inp[0].reshape({n});
+  inp[1] = inp[1].reshape({n});
 
   NdArrayRef cmp_oup[2];
   utils::simulate(kWorldSize, [&](std::shared_ptr<yacl::link::Context> ctx) {
     auto conn = std::make_shared<Communicator>(ctx);
     int rank = ctx->Rank();
-    auto base = std::make_shared<BasicOTProtocols>(
-        conn, CheetahOtKind::YACL_Softspoken);
+    auto base =
+        std::make_shared<BasicOTProtocols>(conn, CheetahOtKind::YACL_Ferret);
 
     CompareProtocol comp_prot(base, radix);
 
@@ -135,7 +138,7 @@ TEST_P(CompareProtTest, CompareBitWidth) {
     [[maybe_unused]] auto b1 = ctx->GetStats()->sent_bytes.load();
     [[maybe_unused]] auto s1 = ctx->GetStats()->sent_actions.load();
 
-    SPDLOG_DEBUG(
+    SPDLOG_INFO(
         "Compare {} bits {} elements sent {} bytes, {} bits each #sent {}", bw,
         inp[0].numel(), (b1 - b0), (b1 - b0) * 8. / inp[0].numel(), (s1 - s0));
 

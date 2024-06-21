@@ -66,6 +66,15 @@ spu_cc_library(
     ],
 )
 
+spu_cc_library(
+    name = "mpc_ckks_encoder",
+    hdrs = ["mpc_ckks_encoder.h"],
+    deps = [
+        "@com_github_microsoft_seal//:seal",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 spu_cc_test(
     name = "modswitch_helper_test",
     srcs = ["modswitch_helper_test.cc"],
@@ -81,5 +90,25 @@ spu_cc_test(
     deps = [
         ":modswitch_helper",
         ":packlwes",
+    ],
+)
+
+spu_cc_test(
+    name = "ckks_gelu_test",
+    srcs = ["ckks_gelu_test.cc"],
+    deps = [
+        ":modswitch_helper",
+        ":packlwes",
+    ],
+)
+
+spu_cc_test(
+    name = "ckks_mpc_test",
+    srcs = ["ckks_mpc_test.cc"],
+    deps = [
+        ":modswitch_helper",
+        ":packlwes",
+        ":mpc_ckks_encoder",
+        "//libspu/mpc/cheetah/arith:arith_comm",
     ],
 )

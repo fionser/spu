@@ -68,6 +68,66 @@ NdArrayRef BasicOTProtocols::B2A(const NdArrayRef &inp) {
   return PackedB2A(inp);
 }
 
+#if 0 
+NdArrayRef BasicOTProtocols::PackedB2A(const NdArrayRef &inp) {
+  const auto *share_t = inp.eltype().as<BShrTy>();
+  auto field = inp.eltype().as<Ring2k>()->field();
+  const size_t nbits = share_t->nbits();
+  SPU_ENFORCE(nbits > 0 && nbits <= 8 * SizeOf(field));
+
+  auto convert_from_bits_form = [&](NdArrayRef _bits) {
+    SPU_ENFORCE(_bits.isCompact(), "need compact input");
+    const int64_t n = _bits.numel() / nbits;
+    // init as all 0s.
+    auto iform = ring_zeros(field, inp.shape());
+    DISPATCH_ALL_FIELDS(field, "conv_to_bits", [&]() {
+      auto bits = NdArrayView<const ring2k_t>(_bits);
+      auto digit = NdArrayView<ring2k_t>(iform);
+      for (int64_t i = 0; i < n; ++i) {
+        // LSB is bits[0]; MSB is bits[nbits - 1]
+        // We iterate the bits in reversed order
+        const size_t offset = i * nbits;
+        digit[i] = 0;
+        for (size_t j = nbits; j > 0; --j) {
+          digit[i] = (digit[i] << 1) | (bits[offset + j - 1] & 1);
+        }
+      }
+    });
+    return iform;
+  };
+
+  const int64_t n = inp.numel();
+  auto rand_bits = RandBits(field, Shape{n * static_cast<int>(nbits)});
+  auto rand = convert_from_bits_form(rand_bits);
+
+  // open c = x ^ r
+  auto opened = OpenShare(ring_xor(inp, rand), ReduceOp::XOR, nbits, conn_);
+
+  // compute c + (1 - 2*c)*<r>
+  NdArrayRef oup = ring_zeros(field, inp.shape());
+  DISPATCH_ALL_FIELDS(field, "packed_b2a", [&]() {
+    using u2k = std::make_unsigned<ring2k_t>::type;
+    int rank = Rank();
+    auto xr = NdArrayView<const u2k>(rand_bits);
+    auto xc = NdArrayView<const u2k>(opened);
+    auto xo = NdArrayView<ring2k_t>(oup);
+
+    for (int64_t i = 0; i < n; ++i) {
+      const size_t offset = i * nbits;
+      u2k this_elt = xc[i];
+      for (size_t j = 0; j < nbits; ++j, this_elt >>= 1) {
+        u2k c_ij = this_elt & 1;
+        ring2k_t one_bit = (1 - c_ij * 2) * xr[offset + j];
+        if (rank == 0) {
+          one_bit += c_ij;
+        }
+        xo[i] += (one_bit << j);
+      }
+    }
+  });
+  return oup;
+}
+#else
 NdArrayRef BasicOTProtocols::PackedB2A(const NdArrayRef &inp) {
   const auto *share_t = inp.eltype().as<BShrTy>();
   auto field = inp.eltype().as<Ring2k>()->field();
@@ -198,6 +258,7 @@ NdArrayRef BasicOTProtocols::PackedB2A(const NdArrayRef &inp) {
   });
   return oup;
 }
+#endif
 
 // Math:
 //   b0^b1 = b0 + b1 - 2*b0*b1
@@ -302,7 +363,7 @@ std::array<NdArrayRef, 2> BasicOTProtocols::CorrelatedBitwiseAnd(
 
   auto field = lhs.eltype().as<Ring2k>()->field();
   const auto *shareType = lhs.eltype().as<BShrTy>();
-  SPU_ENFORCE_EQ(shareType->nbits(), 1UL);
+
   auto [a, b0, c0, b1, c1] = CorrelatedAndTriple(field, lhs.shape());
 
   // open x^a, y^b0, y1^b1

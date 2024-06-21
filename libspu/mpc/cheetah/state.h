@@ -36,6 +36,10 @@ using OTBinaryFunc =
     std::function<NdArrayRef(const NdArrayRef& op0, const NdArrayRef& op1,
                              const std::shared_ptr<BasicOTProtocols>& ot)>;
 
+using OTTernaryFunc = std::function<NdArrayRef(
+    const NdArrayRef& op0, const NdArrayRef& op1, const NdArrayRef& op2,
+    const std::shared_ptr<BasicOTProtocols>& ot)>;
+
 using OTUnaryFuncWithU8 = std::function<NdArrayRef(
     absl::Span<const uint8_t> op, const std::shared_ptr<BasicOTProtocols>& ot)>;
 
@@ -48,6 +52,10 @@ NdArrayRef TiledDispatchOTFunc(KernelEvalContext* ctx, const NdArrayRef& x,
 
 NdArrayRef TiledDispatchOTFunc(KernelEvalContext* ctx, const NdArrayRef& x,
                                const NdArrayRef& y, OTBinaryFunc func);
+
+NdArrayRef TiledDispatchTernaryFunc(KernelEvalContext* ctx, const NdArrayRef& x,
+                                    const NdArrayRef& y, const NdArrayRef& z,
+                                    OTTernaryFunc func);
 
 NdArrayRef TiledDispatchOTFunc(KernelEvalContext* ctx,
                                absl::Span<const uint8_t> x,

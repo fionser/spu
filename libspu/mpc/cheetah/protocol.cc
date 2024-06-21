@@ -77,8 +77,9 @@ void regCheetahProtocol(SPUContext* ctx,
                   cheetah::TruncA,                                          //
                   cheetah::MsbA2B,                                          //
                   cheetah::CommonTypeB, cheetah::CommonTypeV,               //
-                  cheetah::CastTypeB, cheetah::AndBP, cheetah::AndBB,       //
-                  cheetah::XorBP, cheetah::XorBB,                           //
+                  cheetah::CastTypeB, cheetah::AndBP, cheetah::AndBB,
+                  cheetah::AndBBCorrelated,        //
+                  cheetah::XorBP, cheetah::XorBB,  //
                   cheetah::RandA>();
 }
 

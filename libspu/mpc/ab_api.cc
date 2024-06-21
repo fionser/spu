@@ -183,6 +183,20 @@ Value and_bb(SPUContext* ctx, const Value& x, const Value& y) {
   TILED_DISPATCH(ctx, x, y);
 }
 
+std::array<Value, 2> and_bb_corr(SPUContext* ctx, const Value& x,
+                                 const Value& y0, const Value& y1) {
+  if (ctx->hasKernel("and_bb_corr")) {
+    SPU_TRACE_MPC_LEAF(ctx, x, y0, y1);
+    auto ret = dynDispatch<Value>(ctx, __func__, x, y0, y1).data();
+    int64_t n = x.numel();
+    // 2 * n
+    auto ret0 = ret.slice({0}, {n}, {1}).reshape(x.shape());
+    auto ret1 = ret.slice({n}, {2 * n}, {1}).reshape(x.shape());
+    return {Value(ret0, x.dtype()), Value(ret1, x.dtype())};
+  }
+  return {and_bb(ctx, x, y0), and_bb(ctx, x, y1)};
+}
+
 OptionalAPI<Value> and_bv(SPUContext* ctx, const Value& x, const Value& y) {
   TRY_DISPATCH(ctx, x, y);
   return NotAvailable;
@@ -322,13 +336,24 @@ Value ppa_kogge_stone(SPUContext* ctx, const Value& lhs, const Value& rhs,
     auto G1 = lshift_b(ctx, G, offset);
     auto P1 = lshift_b(ctx, P, offset);
 
-    // P1 = P & P1
-    // G1 = G ^ (P & G1)
-    std::vector<Value> res = spu::vmap(
-        {P, P}, {P1, G1},
-        [&](const Value& xx, const Value& yy) { return and_bb(ctx, xx, yy); });
-    P = std::move(res[0]);
-    G = xor_bb(ctx, G, res[1]);
+    if (ctx->hasKernel("and_bb_corr")) {
+      if (idx + 1 < Log2Ceil(nbits)) {
+        auto [and0, and1] = and_bb_corr(ctx, P, P1, G1);
+        P = and0;
+        G = xor_bb(ctx, G, and1);
+      } else {
+        G = xor_bb(ctx, G, and_bb(ctx, P, G1));
+      }
+    } else {
+      // P1 = P & P1
+      // G1 = G ^ (P & G1)
+      std::vector<Value> res =
+          spu::vmap({P, P}, {P1, G1}, [&](const Value& xx, const Value& yy) {
+            return and_bb(ctx, xx, yy);
+          });
+      P = std::move(res[0]);
+      G = xor_bb(ctx, G, res[1]);
+    }
   }
 
   // out = (G << 1) ^ p0

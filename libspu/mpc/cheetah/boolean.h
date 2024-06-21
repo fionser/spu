@@ -83,6 +83,17 @@ class AndBB : public BinaryKernel {
                   const NdArrayRef& rhs) const override;
 };
 
+class AndBBCorrelated : public TernaryKernel {
+ public:
+  static constexpr char kBindName[] = "and_bb_corr";
+
+  Kind kind() const override { return Kind::Dynamic; }
+
+  NdArrayRef proc(KernelEvalContext* ctx, const NdArrayRef& lhs,
+                  const NdArrayRef& rhs0,
+                  const NdArrayRef& rhs1) const override;
+};
+
 class XorBP : public BinaryKernel {
  public:
   static constexpr char kBindName[] = "xor_bp";

@@ -344,4 +344,70 @@ NdArrayRef TiledDispatchOTFunc(KernelEvalContext* ctx, const NdArrayRef& x,
   return out;
 }
 
+NdArrayRef TiledDispatchTernaryFunc(KernelEvalContext* ctx, const NdArrayRef& x,
+                                    const NdArrayRef& y0, const NdArrayRef& y1,
+                                    OTTernaryFunc func) {
+  const Shape& shape = x.shape();
+  SPU_ENFORCE(shape.numel() > 0);
+  SPU_ENFORCE_EQ(shape, y0.shape());
+  SPU_ENFORCE_EQ(shape, y1.shape());
+  // (lazy) init OT
+  int64_t numel = x.numel();
+  int64_t nworker = InitOTState(ctx, numel);
+  int64_t workload = nworker == 0 ? 0 : CeilDiv(numel, nworker);
+
+  if (shape.ndim() != 1) {
+    // TiledDispatchOTFunc over flatten input
+    return TiledDispatchTernaryFunc(ctx, x.reshape({numel}),
+                                    y0.reshape({numel}), y1.reshape({numel}),
+                                    func);
+  }
+
+  std::vector<NdArrayRef> outs(nworker);
+  std::vector<std::future<void>> futures;
+
+  int64_t slice_end = 0;
+  for (int64_t wi = 0; wi + 1 < nworker; ++wi) {
+    int64_t slice_bgn = wi * workload;
+    slice_end = std::min(numel, slice_bgn + workload);
+    auto x_slice = x.slice({slice_bgn}, {slice_end}, {1});
+    auto y0_slice = y0.slice({slice_bgn}, {slice_end}, {1});
+    auto y1_slice = y1.slice({slice_bgn}, {slice_end}, {1});
+    futures.emplace_back(std::async(
+        [&](int64_t idx, const NdArrayRef& inp0, const NdArrayRef& inp1,
+            const NdArrayRef& inp2) {
+          auto ot_instance = ctx->getState<CheetahOTState>()->get(idx);
+          outs[idx] = func(inp0, inp1, inp2, ot_instance);
+        },
+        wi, x_slice, y0_slice, y1_slice));
+  }
+
+  auto x_slice = x.slice({slice_end}, {numel}, {});
+  auto y0_slice = y0.slice({slice_end}, {numel}, {});
+  auto y1_slice = y1.slice({slice_end}, {numel}, {});
+  auto ot_instance = ctx->getState<CheetahOTState>()->get(nworker - 1);
+  outs[nworker - 1] = func(x_slice, y0_slice, y1_slice, ot_instance);
+
+  for (auto&& f : futures) {
+    f.get();
+  }
+
+  NdArrayRef out(outs[0].eltype(), {2L * numel});
+
+  // concat multiple of 2 x n into 2 x n
+  for (int64_t r = 0; r < 2; ++r) {
+    int64_t offset = r * out.elsize() * numel;
+    for (auto& out_slice : outs) {
+      int64_t nn = out_slice.numel() / 2;
+
+      std::memcpy(out.data<std::byte>() + offset,
+                  out_slice.data<std::byte>() + r * nn * out_slice.elsize(),
+                  nn * out_slice.elsize());
+      offset += nn * out_slice.elsize();
+    }
+  }
+
+  return out;
+}
+
 }  // namespace spu::mpc::cheetah

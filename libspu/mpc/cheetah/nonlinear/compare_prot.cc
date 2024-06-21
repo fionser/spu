@@ -135,12 +135,9 @@ NdArrayRef CompareProtocol::DoCompute(const NdArrayRef& inp, bool greater_than,
   }
 
   auto boolean_t = makeType<BShrTy>(field, 1);
-  NdArrayRef prev_cmp =
-      ring_zeros(field, {static_cast<int64_t>(num_digits * num_cmp)})
-          .as(boolean_t);
-  NdArrayRef prev_eq =
-      ring_zeros(field, {static_cast<int64_t>(num_digits * num_cmp)})
-          .as(boolean_t);
+  Shape shape = {num_cmp, num_digits};
+  NdArrayRef prev_cmp = ring_zeros(field, shape).as(boolean_t);
+  NdArrayRef prev_eq = ring_zeros(field, shape).as(boolean_t);
 
   DISPATCH_ALL_FIELDS(field, "copy_leaf", [&]() {
     NdArrayView<ring2k_t> xprev_cmp(prev_cmp);
@@ -173,7 +170,7 @@ std::array<NdArrayRef, 2> CompareProtocol::TraversalANDWithEqFullBinaryTree(
   if (num_digits == 1) {
     return {cmp, eq};
   }
-  SPU_ENFORCE(cmp.shape().size() == 1, "need 1D array");
+  SPU_ENFORCE(cmp.shape().size() == 2, "need 1D array");
   SPU_ENFORCE_EQ(cmp.shape(), eq.shape());
   SPU_ENFORCE_EQ(cmp.numel(), eq.numel());
   SPU_ENFORCE_EQ(num_input * num_digits, (size_t)cmp.numel());
@@ -185,12 +182,18 @@ std::array<NdArrayRef, 2> CompareProtocol::TraversalANDWithEqFullBinaryTree(
     }
     // eq[i-1, j] <- eq[i, 2*j] * eq[i, 2*j+1]
     // cmp[i-1, j] <- cmp[i,2*j] * eq[i,2*j+1] ^ cmp[i,2*j+1]
-    int64_t n = current_num_digits * num_input;
-    auto lhs_eq = eq.slice({0}, {n}, {2});
-    auto rhs_eq = eq.slice({1}, {n}, {2});
+    Index index = {(int64_t)num_input, (int64_t)current_num_digits};
+    auto lhs_eq = eq.slice({0, 0}, index, {1, 2});
+    auto rhs_eq = eq.slice({0, 1}, index, {1, 2});
+    auto lhs_cmp = cmp.slice({0, 0}, index, {1, 2});
+    auto rhs_cmp = cmp.slice({0, 1}, index, {1, 2});
 
-    auto lhs_cmp = cmp.slice({0}, {n}, {2});
-    auto rhs_cmp = cmp.slice({1}, {n}, {2});
+    // int64_t n = current_num_digits * num_input;
+    // auto lhs_eq = eq.slice({0}, {n}, {2});
+    // auto rhs_eq = eq.slice({1}, {n}, {2});
+    //
+    // auto lhs_cmp = cmp.slice({0}, {n}, {2});
+    // auto rhs_cmp = cmp.slice({1}, {n}, {2});
 
     // Correlated ANDs
     //   _eq = rhs_eq & lhs_eq
@@ -213,7 +216,7 @@ std::array<NdArrayRef, 2> CompareProtocol::TraversalANDWithEq(
   // Split the current tree into two subtrees
   size_t current_num_digits = absl::bit_floor(num_digits);
 
-  Shape current_shape({static_cast<int64_t>(current_num_digits * num_input)});
+  Shape current_shape = {(int)num_input, (int)current_num_digits};
   NdArrayRef current_cmp(cmp.eltype(), current_shape);
   NdArrayRef current_eq(eq.eltype(), current_shape);
   // Copy from the CMP and EQ bits for the current sub-full-tree
@@ -234,7 +237,7 @@ std::array<NdArrayRef, 2> CompareProtocol::TraversalANDWithEq(
   size_t remain_num_digits = num_digits - current_num_digits + 1;
   while (remain_num_digits > 1) {
     current_num_digits = absl::bit_floor(remain_num_digits);
-    Shape current_shape({static_cast<int64_t>(current_num_digits * num_input)});
+    Shape current_shape = {(int)num_input, (int)current_num_digits};
     NdArrayRef current_cmp(cmp.eltype(), current_shape);
     NdArrayRef current_eq(eq.eltype(), current_shape);
 
@@ -293,7 +296,7 @@ NdArrayRef CompareProtocol::TraversalANDFullBinaryTree(NdArrayRef cmp,
   //         lt1[1], lt0[3], ..., lt0[2*j+1]
   //         ....
   //         ltn[1], ltn[3], ..., ltn[2*j+1]
-  SPU_ENFORCE(cmp.shape().size() == 1, "need 1D Array");
+  SPU_ENFORCE(cmp.shape().size() == 2, "need 1D Array");
   SPU_ENFORCE_EQ(cmp.shape(), eq.shape());
   SPU_ENFORCE_EQ(num_input * num_digits, (size_t)cmp.numel());
 
@@ -304,12 +307,20 @@ NdArrayRef CompareProtocol::TraversalANDFullBinaryTree(NdArrayRef cmp,
     }
     // eq[i-1, j] <- eq[i, 2*j] * eq[i, 2*j+1]
     // cmp[i-1, j] <- cmp[i,2*j] * eq[i,2*j+1] ^ cmp[i,2*j+1]
-    int64_t n = current_num_digits * num_input;
+    // int64_t n = current_num_digits * num_input;
 
-    auto lhs_eq = eq.slice({0}, {n}, {2});
-    auto rhs_eq = eq.slice({1}, {n}, {2});
-    auto lhs_cmp = cmp.slice({0}, {n}, {2});
-    auto rhs_cmp = cmp.slice({1}, {n}, {2});
+    // auto lhs_eq = eq.slice({0}, {n}, {2});
+    // auto rhs_eq = eq.slice({1}, {n}, {2});
+    // auto lhs_cmp = cmp.slice({0}, {n}, {2});
+    // auto rhs_cmp = cmp.slice({1}, {n}, {2});
+    //
+    Index index = {(int64_t)num_input, (int64_t)current_num_digits};
+    auto lhs_eq = eq.slice({0, 0}, index, {1, 2});
+    auto rhs_eq = eq.slice({0, 1}, index, {1, 2});
+    auto lhs_cmp = cmp.slice({0, 0}, index, {1, 2});
+    auto rhs_cmp = cmp.slice({0, 1}, index, {1, 2});
+    // auto lhs_cmp = cmp.slice({0}, {n}, {2});
+    // auto rhs_cmp = cmp.slice({1}, {n}, {2});
 
     if (current_num_digits == 2) {
       cmp = basic_ot_prot_->BitwiseAnd(lhs_cmp, rhs_eq);
@@ -323,12 +334,12 @@ NdArrayRef CompareProtocol::TraversalANDFullBinaryTree(NdArrayRef cmp,
     int64_t ncol = current_num_digits / 2;
     SPU_ENFORCE_EQ(lhs_eq.numel(), nrow * ncol);
 
-    Shape subshape = {nrow * (ncol - 1)};
+    Shape subshape = {nrow, (ncol - 1)};
     NdArrayRef _lhs_eq(lhs_eq.eltype(), subshape);
     NdArrayRef _rhs_eq(rhs_eq.eltype(), subshape);
     NdArrayRef _lhs_cmp(lhs_cmp.eltype(), subshape);
 
-    NdArrayRef _lhs_cmp_col0(lhs_cmp.eltype(), {static_cast<int64_t>(nrow)});
+    NdArrayRef _lhs_cmp_col0(lhs_cmp.eltype(), {nrow, 1});
     NdArrayRef _rhs_eq_col0(rhs_eq.eltype(), _lhs_cmp_col0.shape());
 
     // Skip the 0-th column and take the remains columns
@@ -357,7 +368,7 @@ NdArrayRef CompareProtocol::TraversalANDFullBinaryTree(NdArrayRef cmp,
         basic_ot_prot_->CorrelatedBitwiseAnd(_rhs_eq, _lhs_cmp, _lhs_eq);
 
     // Concat two ANDs
-    eq = NdArrayRef(eq.eltype(), {_next_cmp_col0.numel() + _next_cmp.numel()});
+    eq = NdArrayRef(eq.eltype(), {nrow, ncol});
     cmp = NdArrayRef(cmp.eltype(), eq.shape());
 
     for (int64_t r = 0; r < nrow; ++r) {
@@ -386,26 +397,28 @@ NdArrayRef CompareProtocol::TraversalAND(NdArrayRef cmp, NdArrayRef eq,
 
   // Split the current tree into two subtrees
   size_t current_num_digits = absl::bit_floor(num_digits);
+  int64_t nrows = num_input;
+  int64_t ncols = num_digits;
+  int64_t subncols = current_num_digits;
 
-  Shape current_shape({static_cast<int64_t>(current_num_digits * num_input)});
-  NdArrayRef current_cmp(cmp.eltype(), current_shape);
-  NdArrayRef current_eq(eq.eltype(), current_shape);
-  // Copy from the CMP and EQ bits for the current sub-full-tree
-  pforeach(0, num_input, [&](int64_t i) {
-    std::memcpy(&current_cmp.at(i * current_num_digits),
-                &cmp.at(i * num_digits), current_num_digits * cmp.elsize());
-    std::memcpy(&current_eq.at(i * current_num_digits), &eq.at(i * num_digits),
-                current_num_digits * eq.elsize());
-  });
+  NdArrayRef current_cmp = cmp.slice({0, 0}, {nrows, subncols}, {1, 1});
+  NdArrayRef current_eq = eq.slice({0, 0}, {nrows, subncols}, {1, 1});
+  NdArrayRef remain_cmp = cmp.slice({0, subncols}, {nrows, ncols}, {1, 1});
+  NdArrayRef remain_eq = eq.slice({0, subncols}, {nrows, ncols}, {1, 1});
 
-  NdArrayRef subtree_cmp = TraversalANDFullBinaryTree(
-      current_cmp, current_eq, num_input, current_num_digits);
+  auto subtree_cmp =
+      TraversalAND(current_cmp, current_eq, num_input, current_num_digits);
+
+  auto [subtree1_cmp, subtree1_eq] = TraversalANDWithEq(
+      remain_cmp, remain_eq, num_input, num_digits - current_num_digits);
+  return ring_xor(subtree1_cmp,
+                  basic_ot_prot_->BitwiseAnd(subtree_cmp, subtree1_eq));
 
   // NOTE(lwj): +1 due to the AND on the sub-full-tree
   size_t remain_num_digits = num_digits - current_num_digits + 1;
   while (remain_num_digits > 1) {
     current_num_digits = absl::bit_floor(remain_num_digits);
-    Shape current_shape({static_cast<int64_t>(current_num_digits * num_input)});
+    Shape current_shape = {(int)num_input, (int)current_num_digits};
     NdArrayRef current_cmp(cmp.eltype(), current_shape);
     NdArrayRef current_eq(eq.eltype(), current_shape);
 
