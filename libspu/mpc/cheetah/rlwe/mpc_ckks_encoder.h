@@ -32,12 +32,19 @@ namespace seal::util {
     }                                                                   \
     inline std::complex<TT> mul_scalar(const std::complex<TT>& a,       \
                                        const TT& s) const {             \
+      using ST = std::make_signed<TT>::type;                            \
       auto c = a * s;                                                   \
+      c.real(static_cast<ST>(c.real()) >> fxp_);                        \
+      c.imag(static_cast<ST>(c.imag()) >> fxp_);                        \
       return c;                                                         \
     }                                                                   \
     inline std::complex<TT> mul_root_scalar(const std::complex<TT>& r,  \
                                             const TT& s) const {        \
-      return r * s;                                                     \
+      using ST = std::make_signed<TT>::type;                            \
+      auto c = r * s;                                                   \
+      c.real(static_cast<ST>(c.real()) >> fxp_);                        \
+      c.imag(static_cast<ST>(c.imag()) >> fxp_);                        \
+      return c;                                                         \
     }                                                                   \
     inline std::complex<TT> guard(const std::complex<TT>& a) const {    \
       return a;                                                         \
@@ -79,34 +86,6 @@ class MPCCKKSEncoder {
                                               std::complex<double>, double>;
   using C64_FFTHandler = seal::util::DWTHandler<std::complex<double>,
                                                 std::complex<double>, double>;
-
-  std::vector<scalar_t> fwd_mat_real_;
-  std::vector<scalar_t> fwd_mat_imag_;
-  std::vector<scalar_t> bwd_mat_real_;
-  std::vector<scalar_t> bwd_mat_imag_;
-
-  void InitFFTMatrix(int n) {
-    fwd_mat_real_.resize(n * n);
-    fwd_mat_imag_.resize(n * n);
-    bwd_mat_real_.resize(n * n);
-    bwd_mat_imag_.resize(n * n);
-
-    for (int j = 0; j < n; ++j) {
-      // omega^{j * k}
-      for (int k = 0; k < n; ++k) {
-        auto powers = std::polar(1.0, -2.0 * j * k * M_PI / n);
-        auto inv_powers = std::polar(1.0, 2.0 * j * k * M_PI / n);
-
-        fwd_mat_real_[j * n + k] = EncodeToFxp<scalar_t>(powers.real(), fxp_);
-        fwd_mat_imag_[j * n + k] = EncodeToFxp<scalar_t>(powers.imag(), fxp_);
-
-        bwd_mat_real_[j * n + k] =
-            EncodeToFxp<scalar_t>(inv_powers.real() / n, fxp_);
-        bwd_mat_imag_[j * n + k] =
-            EncodeToFxp<scalar_t>(inv_powers.imag() / n, fxp_);
-      }
-    }
-  }
 
   MPCCKKSEncoder(int fxp, size_t degree) : fxp_(fxp) {
     SPU_ENFORCE(absl::has_single_bit(degree));
@@ -166,17 +145,21 @@ class MPCCKKSEncoder {
     const size_t n = slots_ * 2;
     SPU_ENFORCE_EQ(input.size(), slots_);
     SPU_ENFORCE_EQ(destination.size(), n);
-    // (V + U*j) * x
-    // V*x + U*x*j
+
+    auto conj =
+        seal::util::allocate<value_t>(n, seal::MemoryManager::GetPool(), 0);
+
     for (size_t i = 0; i < slots_; ++i) {
-      scalar_t real_accum = 0;
-      scalar_t imag_accum = 0;
-      for (size_t j = 0; j < slots_; ++j) {
-        real_accum += bwd_mat_real_.at(i * slots_ + j) * input[j];
-        imag_accum += bwd_mat_imag_.at(i * slots_ + j) * input[j];
-      }
-      destination[i] = real_accum;
-      destination[slots_ + i] = imag_accum;
+      conj[matrix_reps_index_map_[i]].real(input[i]);
+      // NOTE(optimize)
+      // conj[matrix_reps_index_map_[i + slots_]].real(input[i]);
+    }
+
+    scalar_t fix = EncodeToFxp<scalar_t>(1. / n, fxp_);
+    fft_handler_.transform_from_rev(conj.get(), seal::util::get_power_of_two(n),
+                                    inv_root_powers_.data(), &fix);
+    for (size_t i = 0; i < n; ++i) {
+      destination[i] = 2 * conj[i].real();
     }
   }
 

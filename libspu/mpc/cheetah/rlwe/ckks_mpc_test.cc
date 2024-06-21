@@ -263,6 +263,77 @@ void TruncateThenReduce(const seal::Plaintext& pt0, const seal::Plaintext& pt1,
   }
 }
 
+// x0 + x1 in Zk
+// y0 + y1 in Zq
+template <typename T>
+void ModulusExtend(absl::Span<const T> shr0, absl::Span<const T> shr1,
+                   size_t input_width, int extra_delta,
+                   const seal::SEALContext::ContextData& cntxt,
+                   seal::Plaintext& out0, seal::Plaintext& out1) {
+  SPU_ENFORCE(input_width > 0 and sizeof(T) * 8 >= input_width);
+  SPU_ENFORCE(extra_delta > 0);
+
+  size_t n = shr0.size();
+  SPU_ENFORCE_EQ(n, shr1.size());
+
+  const auto& params = cntxt.parms();
+  const auto& modulus = params.coeff_modulus();
+  size_t N = params.poly_modulus_degree();
+  size_t L = modulus.size();
+  SPU_ENFORCE(n <= N);
+  out0.parms_id() = seal::parms_id_zero;
+  out1.parms_id() = seal::parms_id_zero;
+  out0.resize(N * L);
+  out1.resize(N * L);
+
+  T upper = 0;
+  if (input_width < sizeof(T) * 8) {
+    upper = static_cast<T>(1) << input_width;
+  }
+  T half = static_cast<T>(1) << (input_width - 1);
+  T mask = upper - 1;
+
+  for (size_t j = 0; j < L; ++j) {
+    using namespace seal::util;
+    auto _scale = barrett_reduce_64(1UL << extra_delta, modulus[j]);
+    MultiplyUIntModOperand scale;
+    scale.set(_scale, modulus[j]);
+
+    auto half_mod_q = barrett_reduce_64(half, modulus[j]);
+    auto upper_mod_q = add_uint_mod(half_mod_q, half_mod_q, modulus[j]);
+
+    for (size_t i = 0; i < n; ++i) {
+      // Convert SignedExtension to ZeroExtension
+      //
+      // SExtend(x) = ZeroExtend(x + 2^{k - 1}) - 2^{k - 1} mod Q
+      //
+      // The following local computations are perform on share0.
+      T two_component = (shr0[i] + half) & mask;
+
+      // x0 + x1 >= 2^k
+      // x0 >= -x1
+      // TODO Use heuristic to compute the wrap
+      bool wrap = (two_component >= (upper - shr1[i]));
+
+      // Compute [x] - <wrap> * 2^k mod Q
+      // The term 2^k mod Q (i.e., upper_mod_q)
+      uint64_t t0 = barrett_reduce_64(two_component, modulus[j]);
+      if (wrap) {
+        t0 = sub_uint_mod(t0, upper_mod_q, modulus[j]);
+      }
+      // subtract 2^{k - 1} mod Q to convert to SignedExtension.
+      // NOTE(lwj) lazy reduction here
+      t0 = modulus[j].value() + t0 - half_mod_q;
+
+      out0[j * N + i] = multiply_uint_mod(t0, scale, modulus[j]);
+      out1[j * N + i] = multiply_uint_mod(shr1[i] & mask, scale, modulus[j]);
+    }
+  }
+
+  out0.parms_id() = cntxt.parms_id();
+  out1.parms_id() = cntxt.parms_id();
+}
+
 template <typename T>
 void TruncateThenReduce(const seal::Plaintext& ckks_pt,
                         const seal::SEALContext::ContextData& cntxt,
@@ -420,6 +491,7 @@ int main_back() {
   printf("max trunc error %f\n\n", trunc_err);
 
   ckks_encoder.encode(slots, std::pow(2.0, scale), pt);
+
   encryptor.encrypt_symmetric(pt, ct);
 
   // CKKS Computation Begin
@@ -544,7 +616,103 @@ void evaluate_poly4(const seal::Ciphertext& ct,
   eval.add_inplace(out, powers[2]);
 }
 
+void test_modulus_extend() {
+  const size_t poly_N = 1024;
+  const size_t nslots = poly_N / 2;
+
+  const int scale = 28;
+  const int mpc_fxp = 18;
+  std::vector<int> modulus_bits = {40, 40, 2 * scale, 60};
+
+  const int fft_fxp = std::log2(poly_N) + 12;
+
+  auto modulus = seal::CoeffModulus::Create(poly_N, modulus_bits);
+
+  seal::EncryptionParameters parms(seal::scheme_type::ckks);
+  parms.set_use_special_prime(true);
+  parms.set_poly_modulus_degree(poly_N);
+  parms.set_coeff_modulus(modulus);
+  seal::SEALContext context(parms, true, seal::sec_level_type::none);
+
+  using mpc_t = uint64_t;
+  [[maybe_unused]] size_t mpc_width = 64;
+
+  std::vector<double> slots(nslots);
+  std::uniform_real_distribution<double> uniform(-8.0, 8.0);
+  std::default_random_engine rdv(std::time(0));
+  std::generate_n(slots.data(), nslots, [&]() { return uniform(rdv); });
+
+  std::uniform_int_distribution<mpc_t> mpc_uniform(0, static_cast<mpc_t>(-1));
+  std::vector<mpc_t> mpc_vec0(nslots);
+  std::vector<mpc_t> mpc_vec1(nslots);
+
+  for (size_t i = 0; i < nslots; ++i) {
+    mpc_vec0[i] = mpc_uniform(rdv);
+    mpc_vec1[i] = EncodeToFxp<mpc_t>(slots[i], mpc_fxp) - mpc_vec0[i];
+  }
+
+  seal::CKKSEncoder ckks_encoder(context);
+  seal::Plaintext pt;
+  ckks_encoder.encode(slots, std::pow(2.0, scale), pt);
+
+  std::vector<double> expected_coeffs(poly_N);
+  InvNttInplace(pt, context);
+  FromCKKSPt(pt, std::pow(2.0, scale), context,
+             absl::MakeSpan(expected_coeffs));
+
+  MPCCKKSEncoder<mpc_t> mpc_ckks_encoder(fft_fxp, poly_N);
+
+  std::vector<mpc_t> mpc_encoded_vec0(poly_N);
+  std::vector<mpc_t> mpc_encoded_vec1(poly_N);
+  mpc_ckks_encoder.encode(mpc_vec0, absl::MakeSpan(mpc_encoded_vec0));
+  mpc_ckks_encoder.encode(mpc_vec1, absl::MakeSpan(mpc_encoded_vec1));
+
+  double encode_err = 0.0;
+  for (size_t i = 0; i < poly_N; ++i) {
+    double diff = std::abs(
+        expected_coeffs[i] -
+        ToSignType(mpc_encoded_vec0[i] + mpc_encoded_vec1[i], mpc_width) /
+            std::pow(2., mpc_fxp));
+    encode_err = std::max(encode_err, diff);
+  }
+  printf("encode error %f\n", encode_err);
+
+  seal::Plaintext poly0;
+  seal::Plaintext poly1;
+
+  ModulusExtend<mpc_t>(
+      absl::MakeSpan(mpc_encoded_vec0), absl::MakeSpan(mpc_encoded_vec1),
+      mpc_width, scale - mpc_fxp, *context.first_context_data(), poly0, poly1);
+
+  NttInplace(poly0, context);
+  NttInplace(poly1, context);
+
+  poly0.scale() = std::pow(2.0, scale);
+  poly1.scale() = std::pow(2.0, scale);
+
+  seal::Evaluator evaluator(context);
+  seal::KeyGenerator keygen(context);
+  auto sk = keygen.secret_key();
+  seal::Encryptor encryptor(context, sk);
+  seal::Decryptor decryptor(context, sk);
+
+  seal::Ciphertext ct;
+  encryptor.encrypt_symmetric(poly0, ct);
+  evaluator.add_plain_inplace(ct, poly1);
+
+  seal::Plaintext dec;
+  decryptor.decrypt(ct, dec);
+  std::vector<double> got_slots;
+  ckks_encoder.decode(dec, got_slots);
+
+  for (size_t i = 0; i < 8; ++i) {
+    printf("%f => %f\n", slots[i], got_slots[i]);
+  }
+}
+
 int main() {
+  test_modulus_extend();
+  return 0;
   const size_t poly_N = 8192;
   const size_t nslots = poly_N / 2;
   const double apprx_range = 4.0;
