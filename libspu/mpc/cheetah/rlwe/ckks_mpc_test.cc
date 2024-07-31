@@ -995,6 +995,16 @@ void ConvToMPC(absl::Span<const double> real, absl::Span<T> shr0,
   }
 }
 
+/**
+ * To run this demo, we need to modify the SEAL's codes
+ *
+ * https://github.com/microsoft/SEAL/blob/main/native/src/seal/ckks.cpp#L34
+ * Change the `uint64_t gen = 3;` to `uint64_t gen = 5;`
+ *
+ * https://github.com/microsoft/SEAL/blob/main/native/src/seal/util/galois.h#L169
+ * Change `generator_ = 3;` to `generator_ = 5;`
+ *
+ * */
 int main() {
   const size_t poly_N = 8192;
   const size_t nslots = poly_N / 2;
@@ -1121,22 +1131,6 @@ int main() {
     // which should decrypt to the CKKS encoding of the target vector.
     evaluator.add_plain_inplace(ct, poly1);
     // Split real/imag parts via HE conjugation (needs one KeySwitch)
-    if (0) {
-      std::vector<std::complex<double>> decoded;
-      seal::Plaintext pt;
-      decryptor.decrypt(ct, pt);
-      ckks_encoder.decode(pt, decoded);
-      double max_e = 0.0;
-      for (size_t i = 0; i < nslots; ++i) {
-        double e = decoded[i].real() - real_slots[i];
-        max_e = std::max(max_e, std::abs(e));
-
-        e = decoded[i].imag() - imag_slots[i];
-        max_e = std::max(max_e, std::abs(e));
-      }
-      printf("ModulusExtend max error %f\n", max_e);
-    }
-
     seal::Ciphertext ct1;
     {
       seal::Ciphertext tmp;
