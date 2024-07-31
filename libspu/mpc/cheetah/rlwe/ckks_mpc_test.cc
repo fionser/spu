@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include "seal/util/dwthandler.h"
 #include "seal/util/polyarithsmallmod.h"
 #include "seal/util/uintcore.h"
+#include "utils.h"
 
 #include "libspu/mpc/cheetah/arith/common.h"
 #include "libspu/mpc/cheetah/rlwe/mpc_ckks_encoder.h"
@@ -198,7 +200,7 @@ void TruncateThenReduce(const seal::Plaintext& pt0, const seal::Plaintext& pt1,
                         const seal::SEALContext::ContextData& cntxt,
                         size_t shift_amount, size_t out_width,
                         absl::Span<T> out0, absl::Span<T> out1) {
-  SPU_ENFORCE(out_width > 0 and out_width <= 64,
+  SPU_ENFORCE(out_width > 0 and out_width <= 128,
               "Support out_width <= 64 for now");
   const auto& params = cntxt.parms();
   const auto& modulus = params.coeff_modulus();
@@ -262,8 +264,62 @@ void TruncateThenReduce(const seal::Plaintext& pt0, const seal::Plaintext& pt1,
   }
 }
 
+// y0 = round(Q/2^k*x0) mod Q
+// y1 = round(Q/2^k*x1) mod Q
+//
+// x0 + x1 = x + w*2^k
+//
+//   Q/2^k*x0  + Q/2^k*x1 mod Q
+// = Q/2^k*(x0 + x1) mod Q
+// = Q/2^k*(x + w^k) mod Q
+// = Q/2^k*x
 // x0 + x1 in Zk
 // y0 + y1 in Zq
+template <typename T>
+void ModulusExtend(absl::Span<const T> shr0, absl::Span<const T> shr1,
+                   size_t input_width, int extra_delta,
+                   const seal::SEALContext& context, seal::parms_id_type pid,
+                   seal::Plaintext& out0, seal::Plaintext& out1) {
+  SPU_ENFORCE(input_width > 0 and sizeof(T) * 8 >= input_width);
+  SPU_ENFORCE(extra_delta > 0);
+
+  size_t n = shr0.size();
+  SPU_ENFORCE_EQ(n, shr1.size());
+
+  auto cntxt = context.get_context_data(pid);
+  const auto& params = cntxt->parms();
+  const auto& modulus = params.coeff_modulus();
+  size_t N = params.poly_modulus_degree();
+  size_t L = modulus.size();
+  SPU_ENFORCE(n <= N);
+  out0.parms_id() = seal::parms_id_zero;
+  out1.parms_id() = seal::parms_id_zero;
+  out0.resize(N * L);
+  out1.resize(N * L);
+
+  EnableCPRNG cprng;
+  cprng.UniformPoly(context, &out0, pid);
+  using sT = typename std::make_signed<T>::type;
+  for (size_t j = 0; j < L; ++j) {
+    auto dst0 = out0.data() + j * n;
+    auto dst1 = out1.data() + j * n;
+    for (size_t i = 0; i < n; ++i) {
+      sT x = shr0[i] + shr1[i];
+      T ux = std::abs(x);
+      ux <<= extra_delta;
+
+      uint64_t v = BarrettReduce(ux, modulus[j]);
+      if (std::signbit(x)) {
+        v = seal::util::negate_uint_mod(v, modulus[j]);
+      }
+      dst1[i] = seal::util::sub_uint_mod(v, dst0[i], modulus[j]);
+    }
+  }
+
+  out0.parms_id() = pid;
+  out1.parms_id() = pid;
+}
+
 template <typename T>
 void ModulusExtend(absl::Span<const T> shr0, absl::Span<const T> shr1,
                    size_t input_width, int extra_delta,
@@ -583,7 +639,8 @@ void evaluate_poly4(const seal::Ciphertext& ct,
   auto B = context.get_context_data(ct.parms_id())
                ->next_context_data()
                ->total_coeff_modulus_bit_count();
-  const double coeff_scale = std::pow(2., B - 2) / std::pow(ct.scale(), 2);
+  [[maybe_unused]] const double coeff_scale =
+      std::pow(2., B - 2) / std::pow(ct.scale(), 2);
 
   seal::Evaluator eval(context);
 
@@ -616,7 +673,7 @@ void evaluate_poly4(const seal::Ciphertext& ct,
 }
 
 void test_modulus_extend() {
-  const size_t poly_N = 1024;
+  const size_t poly_N = 8192;
   const size_t nslots = poly_N / 2;
 
   const int scale = 28;
@@ -634,88 +691,101 @@ void test_modulus_extend() {
   seal::SEALContext context(parms, true, seal::sec_level_type::none);
 
   using mpc_t = uint64_t;
-  [[maybe_unused]] size_t mpc_width = 64;
+  [[maybe_unused]] size_t mpc_width = 8 * sizeof(mpc_t);
 
-  std::vector<double> slots(nslots);
+  // real || imag parts
+  std::vector<std::complex<double>> slots(nslots);
   std::uniform_real_distribution<double> uniform(-8.0, 8.0);
   std::default_random_engine rdv(std::time(0));
-  std::generate_n(slots.data(), nslots, [&]() { return uniform(rdv); });
 
   std::uniform_int_distribution<mpc_t> mpc_uniform(0, static_cast<mpc_t>(-1));
-  std::vector<mpc_t> mpc_vec0(nslots);
-  std::vector<mpc_t> mpc_vec1(nslots);
+  std::vector<std::complex<mpc_t>> mpc_vec0(nslots);
+  std::vector<std::complex<mpc_t>> mpc_vec1(nslots);
 
-  for (size_t i = 0; i < nslots; ++i) {
-    mpc_vec0[i] = mpc_uniform(rdv);
-    mpc_vec1[i] = EncodeToFxp<mpc_t>(slots[i], mpc_fxp) - mpc_vec0[i];
-  }
+  int rep = 10;
+  for (int iter = 0; iter < rep; ++iter) {
+    std::generate_n(reinterpret_cast<double*>(slots.data()), 2 * nslots,
+                    [&]() { return uniform(rdv); });
 
-  seal::CKKSEncoder ckks_encoder(context);
-  seal::Plaintext pt;
-  ckks_encoder.encode(slots, std::pow(2.0, scale), pt);
+    for (size_t i = 0; i < nslots; ++i) {
+      mpc_vec0[i].real(mpc_uniform(rdv));
+      mpc_vec0[i].imag(mpc_uniform(rdv));
 
-  std::vector<double> expected_coeffs(poly_N);
-  InvNttInplace(pt, context);
-  FromCKKSPt(pt, std::pow(2.0, scale), context,
-             absl::MakeSpan(expected_coeffs));
+      mpc_vec1[i].real(EncodeToFxp<mpc_t>(slots[i].real(), mpc_fxp) -
+                       mpc_vec0[i].real());
+      mpc_vec1[i].imag(EncodeToFxp<mpc_t>(slots[i].imag(), mpc_fxp) -
+                       mpc_vec0[i].imag());
+    }
 
-  MPCCKKSEncoder<mpc_t> mpc_ckks_encoder(fft_fxp, poly_N);
+    seal::CKKSEncoder ckks_encoder(context);
+    seal::Plaintext pt;
+    ckks_encoder.encode(slots, std::pow(2.0, scale), pt);
 
-  std::vector<mpc_t> mpc_encoded_vec0(poly_N);
-  std::vector<mpc_t> mpc_encoded_vec1(poly_N);
-  mpc_ckks_encoder.encode(mpc_vec0, absl::MakeSpan(mpc_encoded_vec0));
-  mpc_ckks_encoder.encode(mpc_vec1, absl::MakeSpan(mpc_encoded_vec1));
+    std::vector<double> expected_coeffs(poly_N);
+    InvNttInplace(pt, context);
+    FromCKKSPt(pt, std::pow(2.0, scale), context,
+               absl::MakeSpan(expected_coeffs));
 
-  double encode_err = 0.0;
-  for (size_t i = 0; i < poly_N; ++i) {
-    double diff = std::abs(
-        expected_coeffs[i] -
-        ToSignType(mpc_encoded_vec0[i] + mpc_encoded_vec1[i], mpc_width) /
-            std::pow(2., mpc_fxp));
-    encode_err = std::max(encode_err, diff);
-  }
-  printf("encode error %f\n", encode_err);
+    MPCCKKSEncoder<mpc_t> mpc_ckks_encoder(fft_fxp, poly_N);
 
-  seal::Plaintext poly0;
-  seal::Plaintext poly1;
+    std::vector<mpc_t> mpc_encoded_vec0(poly_N);
+    std::vector<mpc_t> mpc_encoded_vec1(poly_N);
+    mpc_ckks_encoder.encode_complex(mpc_vec0, absl::MakeSpan(mpc_encoded_vec0));
+    mpc_ckks_encoder.encode_complex(mpc_vec1, absl::MakeSpan(mpc_encoded_vec1));
 
-  ModulusExtend<mpc_t>(
-      absl::MakeSpan(mpc_encoded_vec0), absl::MakeSpan(mpc_encoded_vec1),
-      mpc_width, scale - mpc_fxp, *context.first_context_data(), poly0, poly1);
+    double encode_err = 0.0;
+    for (size_t i = 0; i < poly_N; ++i) {
+      double diff = std::abs(
+          expected_coeffs[i] -
+          ToSignType(mpc_encoded_vec0[i] + mpc_encoded_vec1[i], mpc_width) /
+              std::pow(2., mpc_fxp));
+      encode_err = std::max(encode_err, diff);
+    }
+    printf("encode error %f\n", encode_err);
 
-  NttInplace(poly0, context);
-  NttInplace(poly1, context);
+    seal::Plaintext poly0;
+    seal::Plaintext poly1;
 
-  poly0.scale() = std::pow(2.0, scale);
-  poly1.scale() = std::pow(2.0, scale);
+    ModulusExtend<mpc_t>(absl::MakeSpan(mpc_encoded_vec0),
+                         absl::MakeSpan(mpc_encoded_vec1), mpc_width,
+                         scale - mpc_fxp, context, context.first_parms_id(),
+                         poly0, poly1);
 
-  seal::Evaluator evaluator(context);
-  seal::KeyGenerator keygen(context);
-  auto sk = keygen.secret_key();
-  seal::Encryptor encryptor(context, sk);
-  seal::Decryptor decryptor(context, sk);
+    NttInplace(poly0, context);
+    NttInplace(poly1, context);
 
-  seal::Ciphertext ct;
-  encryptor.encrypt_symmetric(poly0, ct);
-  evaluator.add_plain_inplace(ct, poly1);
+    poly0.scale() = std::pow(2.0, scale);
+    poly1.scale() = std::pow(2.0, scale);
 
-  seal::Plaintext dec;
-  decryptor.decrypt(ct, dec);
-  std::vector<double> got_slots;
-  ckks_encoder.decode(dec, got_slots);
+    seal::Evaluator evaluator(context);
+    seal::KeyGenerator keygen(context);
+    auto sk = keygen.secret_key();
+    seal::Encryptor encryptor(context, sk);
+    seal::Decryptor decryptor(context, sk);
 
-  for (size_t i = 0; i < 8; ++i) {
-    printf("%f => %f\n", slots[i], got_slots[i]);
+    seal::Ciphertext ct;
+    encryptor.encrypt_symmetric(poly0, ct);
+    evaluator.add_plain_inplace(ct, poly1);
+
+    seal::Plaintext dec;
+    decryptor.decrypt(ct, dec);
+    std::vector<std::complex<double>> got_slots;
+    ckks_encoder.decode(dec, got_slots);
+
+    for (size_t i = 0; i < 8; ++i) {
+      printf("%f => %f; %f => %f\n", slots[i].real(), got_slots[i].real(),
+             slots[i].imag(), got_slots[i].imag());
+    }
   }
 }
 
 // HETransformer's method
 void test_ckks_to_mpc(int scale) {
-  const size_t poly_N = 1024;
+  const size_t poly_N = 8192;
   const size_t nslots = poly_N / 2;
 
   // Pr(\sqrt{N} * Delta * 2/ q0)
-  std::vector<int> modulus_bits = {50, 20};
+  std::vector<int> modulus_bits = {50, 40, 20};
 
   auto modulus = seal::CoeffModulus::Create(poly_N, modulus_bits);
 
@@ -761,7 +831,7 @@ void test_ckks_to_mpc(int scale) {
 
     std::default_random_engine rdv(std::time(0));
     std::generate_n(reinterpret_cast<double*>(real_slots.data()), 2 * nslots,
-                    [&]() { return 128 + uniform(rdv); });
+                    [&]() { return uniform(rdv); });
 
     // std::generate_n(reinterpret_cast<double*>(real_slots.data()), 2 * nslots,
     //                 []() { return 10.0; });
@@ -913,29 +983,40 @@ void test_ckks_to_mpc(int scale) {
          std::log2(count_err * 1.0 / (ntrial * poly_N)), count_err);
 }
 
+template <typename T>
+void ConvToMPC(absl::Span<const double> real, absl::Span<T> shr0,
+               absl::Span<T> shr1, int fxp) {
+  std::default_random_engine rdv(std::time(0));
+  std::uniform_int_distribution<T> mpc_uniform(0, static_cast<T>(-1));
+  size_t nsize = real.size();
+  for (size_t i = 0; i < nsize; ++i) {
+    shr0[i] = mpc_uniform(rdv);
+    shr1[i] = EncodeToFxp<T>(real[i], fxp) - shr0[i];
+  }
+}
+
 int main() {
-  // test_ckks_to_mpc(38);
-  //  test_ckks_to_mpc(40);
-  //   test_modulus_extend();
-  //
   const size_t poly_N = 8192;
   const size_t nslots = poly_N / 2;
   const double apprx_range = 4.0;
 
-  const int scale = 28;
   const int mpc_fxp = 20;
   const int fft_fxp = std::log2(poly_N) + 12;
+  const int scale = 28;
 
   using mpc_t = uint64_t;
-  size_t mpc_width = 64;
+  // NOTE(lwj): we need to peform the local CKKS encoding in a larger ring size.
+  using dmpc_t = uint128_t;
+  size_t mpc_width = 8 * sizeof(mpc_t);
 
-  std::vector<int> modulus_bits = {40, 40, 2 * scale, 60};
+  std::vector<int> modulus_bits = {50, 40, 2 * scale, 60};
 
   printf("Q = %dbits\n",
          std::accumulate(modulus_bits.begin(), modulus_bits.end() - 1, 0));
 
   auto modulus = seal::CoeffModulus::Create(poly_N, modulus_bits);
 
+  MPCCKKSEncoder<dmpc_t> dmpc_ckks_decoder(fft_fxp, poly_N);
   MPCCKKSEncoder<mpc_t> mpc_ckks_decoder(fft_fxp, poly_N);
 
   EnableCPRNG cprng;
@@ -962,98 +1043,155 @@ int main() {
 
   std::vector<double> real_slots(nslots);
   std::vector<double> imag_slots(nslots);
+
+  std::vector<dmpc_t> real_mpc_vec0(nslots);
+  std::vector<dmpc_t> real_mpc_vec1(nslots);
+  std::vector<dmpc_t> imag_mpc_vec0(nslots);
+  std::vector<dmpc_t> imag_mpc_vec1(nslots);
+  std::vector<std::complex<dmpc_t>> compx_mpc_vec0(nslots);
+  std::vector<std::complex<dmpc_t>> compx_mpc_vec1(nslots);
+  std::vector<mpc_t> mpc_poly_coeff0(poly_N);
+  std::vector<mpc_t> mpc_poly_coeff1(poly_N);
+  seal::Plaintext poly0;
+  seal::Plaintext poly1;
+
   std::vector<std::complex<double>> complex_slots(nslots);
 
   double real_err = 0.0;
   double imag_err = 0.0;
-  int trial = (1L << 26) / poly_N;
+  int trial = (1L << 23) / poly_N;
   printf("trials %d, N = %zd, Delta = %d bit\n", trial, poly_N, scale);
 
+  std::random_device rdv;
   for (int rep = 0; rep < trial; ++rep) {
+    // sample reals from [0.0, 4.0)
     std::uniform_real_distribution<double> uniform(0.0, apprx_range);
-    std::default_random_engine rdv(std::time(0));
     std::generate_n(real_slots.data(), nslots, [&]() { return uniform(rdv); });
     std::generate_n(imag_slots.data(), nslots, [&]() { return uniform(rdv); });
 
+    // Prepare MPC of fixed-point vector
+    ConvToMPC<dmpc_t>(absl::MakeSpan(real_slots), absl::MakeSpan(real_mpc_vec0),
+                      absl::MakeSpan(real_mpc_vec1), mpc_fxp - 1);
+
+    ConvToMPC<dmpc_t>(absl::MakeSpan(imag_slots), absl::MakeSpan(imag_mpc_vec0),
+                      absl::MakeSpan(imag_mpc_vec1), mpc_fxp - 1);
+
+    // Each party encodes his local share to a poly over the MPC modulus
+    // NOTE(lwj): we do arith right-shift because the real/imag seperation will
+    // introduce a factor of 2.
     for (size_t i = 0; i < nslots; ++i) {
-      complex_slots[i].real(0.5 * real_slots[i]);
-      complex_slots[i].imag(0.5 * imag_slots[i]);
+      compx_mpc_vec0[i].real(real_mpc_vec0[i]);
+      compx_mpc_vec0[i].imag(imag_mpc_vec0[i]);
+
+      compx_mpc_vec1[i].real(real_mpc_vec1[i]);
+      compx_mpc_vec1[i].imag(imag_mpc_vec1[i]);
     }
 
-    seal::Plaintext pt;
+    std::vector<dmpc_t> dmpc_poly_coeff0(poly_N);
+    std::vector<dmpc_t> dmpc_poly_coeff1(poly_N);
+    // local CKKS encoding over the MPC modulus 2^k
+    dmpc_ckks_decoder.encode_complex(absl::MakeConstSpan(compx_mpc_vec0),
+                                     absl::MakeSpan(dmpc_poly_coeff0));
+    dmpc_ckks_decoder.encode_complex(absl::MakeConstSpan(compx_mpc_vec1),
+                                     absl::MakeSpan(dmpc_poly_coeff1));
+    // ring change from u128 to u64
+    std::transform(dmpc_poly_coeff0.begin(), dmpc_poly_coeff0.end(),
+                   mpc_poly_coeff0.data(),
+                   [](dmpc_t x) -> mpc_t { return static_cast<mpc_t>(x); });
+    std::transform(dmpc_poly_coeff1.begin(), dmpc_poly_coeff1.end(),
+                   mpc_poly_coeff1.data(),
+                   [](dmpc_t x) -> mpc_t { return static_cast<mpc_t>(x); });
+
+    // Simulate a MPC protocol to convert modulus from to modulus Q
+    ModulusExtend<mpc_t>(absl::MakeSpan(mpc_poly_coeff0),
+                         absl::MakeSpan(mpc_poly_coeff1), mpc_width,
+                         scale - mpc_fxp, context, context.first_parms_id(),
+                         poly0, poly1);
+
+    NttInplace(poly0, context);
+    NttInplace(poly1, context);
+
+    poly0.scale() = 1L << scale;
+    poly1.scale() = 1L << scale;
+
+    // Alice sends to Bob his ct Enc(poly0)
     seal::Ciphertext ct;
+    encryptor.encrypt_symmetric(poly0, ct);
+    // Bob local reconstruct the ct Enc(poly0 + poly1 mod Q)
+    // which should decrypt to the CKKS encoding of the target vector.
+    evaluator.add_plain_inplace(ct, poly1);
+    // Split real/imag parts via HE conjugation (needs one KeySwitch)
+    if (0) {
+      std::vector<std::complex<double>> decoded;
+      seal::Plaintext pt;
+      decryptor.decrypt(ct, pt);
+      ckks_encoder.decode(pt, decoded);
+      double max_e = 0.0;
+      for (size_t i = 0; i < nslots; ++i) {
+        double e = decoded[i].real() - real_slots[i];
+        max_e = std::max(max_e, std::abs(e));
+
+        e = decoded[i].imag() - imag_slots[i];
+        max_e = std::max(max_e, std::abs(e));
+      }
+      printf("ModulusExtend max error %f\n", max_e);
+    }
+
     seal::Ciphertext ct1;
-
-    ckks_encoder.encode(complex_slots, std::pow(2.0, scale), pt);
-    encryptor.encrypt_symmetric(pt, ct);
-    size_t sent_bytes = EncodeSEALObject(ct).size() >> 1;
-
-    // x - y*j
     {
       seal::Ciphertext tmp;
+      // x + y*j => x - y*j
       evaluator.complex_conjugate(ct, gk, tmp);
-
-      // x + yj - (x - yj)
-      // 2 * yj
-      evaluator.sub(ct, tmp, ct1);
-      evaluator.negate_inplace(ct1);
+      // x + y*j - (x - y*j)
+      // - 2 * y*j
+      evaluator.sub(tmp, ct, ct1);
+      // - 2 * y*j => 2*y
       MulImageUnitInplace(ct1, context);
-
+      // x + y*j + (x - y*j) => 2*x
       evaluator.add_inplace(ct, tmp);
     }
 
-    // ckks_encoder.encode(imag_slots, std::pow(2.0, scale), pt);
-    // encryptor.encrypt_symmetric(pt, ct1);
-
-    // CKKS Computation Begin
+    // Finally the CKKS computation on Bob's side
+    // BOLT's degree-4 polys for GELU
+    std::vector<double> coeff2 = {0.001620808531841547, -0.03798164612714154};
     std::vector<double> coeff3 = {0.5410550166368381, -0.18352506127082727,
                                   0.020848611754127593};
+    // Evaluate a polynomial f(x) = a2*x^2 + a3*x^3 + a4*x^4
     seal::Ciphertext gelu_ct;
     seal::Ciphertext gelu_ct1;
     evaluate_poly4(ct, context, rk, coeff3, gelu_ct);
     evaluate_poly4(ct1, context, rk, coeff3, gelu_ct1);
-
+    // Merge the two ciphertexts into one
     InvNttInplace(gelu_ct, context);
     InvNttInplace(gelu_ct1, context);
     MulImageUnitInplace(gelu_ct1, context);
-    evaluator.add(gelu_ct, gelu_ct1, ct);
-
+    seal::Ciphertext final_ct;
+    evaluator.add(gelu_ct, gelu_ct1, final_ct);
     // CKKS Computation End
-    size_t recv_bytes = EncodeSEALObject(ct).size();
-
-    if (rep == 0) {
-      printf("%zd gelu sent %zd B, recv %zd B, %f B per\n", nslots * 2,
-             sent_bytes, recv_bytes,
-             (sent_bytes + recv_bytes) * 1.0 / (2 * nslots));
-    }
 
     seal::Plaintext rnd;
     seal::Plaintext decrypt;
-    cprng.UniformPoly(context, &rnd, ct.parms_id());
+    // sample r from Rq
+    cprng.UniformPoly(context, &rnd, final_ct.parms_id());
 
-    InvNttInplace(ct, context);
-    SubPlainInplace(ct, rnd, context);
+    InvNttInplace(final_ct, context);
+    // mask the cipher: ct - r
+    SubPlainInplace(final_ct, rnd, context);
 
-    NttInplace(ct, context);
+    NttInplace(final_ct, context);
 
-    decryptor.decrypt(ct, decrypt);
+    decryptor.decrypt(final_ct, decrypt);
     InvNttInplace(decrypt, context);
 
     std::vector<mpc_t> mpc0(poly_N);
     std::vector<mpc_t> mpc1(poly_N);
 
+    // Convert mod q (poly) to mod 2^k poly
+    // And handle the ckks Delta to mpc's fixed point scaling.
     TruncateThenReduce<mpc_t>(
-        rnd, decrypt, *context.get_context_data(ct.parms_id()),
-        static_cast<int>(std::log2(ct.scale())) - mpc_fxp, mpc_width,
+        rnd, decrypt, *context.get_context_data(final_ct.parms_id()),
+        static_cast<int>(std::log2(final_ct.scale())) - mpc_fxp, mpc_width,
         absl::MakeSpan(mpc0), absl::MakeSpan(mpc1));
-
-    // TruncateThenReduce<mpc_t>(rnd, *context.get_context_data(ct.parms_id()),
-    //                           scale - mpc_fxp, mpc_width, false,
-    //                           absl::MakeSpan(mpc0));
-    // TruncateThenReduce<mpc_t>(decrypt,
-    // *context.get_context_data(ct.parms_id()),
-    //                           scale - mpc_fxp, mpc_width, true,
-    //                           absl::MakeSpan(mpc1));
 
     std::vector<mpc_t> mpc_real0(nslots);
     std::vector<mpc_t> mpc_real1(nslots);
@@ -1061,16 +1199,16 @@ int main() {
     std::vector<mpc_t> mpc_imag0(nslots);
     std::vector<mpc_t> mpc_imag1(nslots);
 
-    // TODO(lwj): apply the O(n^2) algorithm to reduce the multiplication depth
+    // Alice local decoding
     mpc_ckks_decoder.decode_complex(absl::MakeSpan(mpc0),
                                     absl::MakeSpan(mpc_real0),
                                     absl::MakeSpan(mpc_imag0));
+    // Bob local decoding
     mpc_ckks_decoder.decode_complex(absl::MakeSpan(mpc1),
                                     absl::MakeSpan(mpc_real1),
                                     absl::MakeSpan(mpc_imag1));
-    // 0.001620808531841547, -0.03798164612714154
-
-    auto gelu_func = [](double x) {
+    // Correctness check
+    [[maybe_unused]] auto gelu_func = [](double x) {
       return 0.5 * x *
              (1.0 + std::tanh(std::sqrt(2.0 / M_PI) *
                               (x + 0.044715 * std::pow(x, 3.0))));
@@ -1083,23 +1221,19 @@ int main() {
                         static_cast<double>(1L << mpc_fxp);
 
       auto expected_real = gelu_func(real_slots[i]) - 0.5 * real_slots[i] -
-                           0.001620808531841547 -
-                           (-0.03798164612714154) * real_slots[i];
+                           coeff2[0] - coeff2[1] * std::abs(real_slots[i]);
       auto expected_imag = gelu_func(imag_slots[i]) - 0.5 * imag_slots[i] -
-                           0.001620808531841547 -
-                           (-0.03798164612714154) * imag_slots[i];
+                           coeff2[0] - coeff2[1] * std::abs(imag_slots[i]);
 
       auto diff = std::abs(expected_real - got_real);
       real_err = std::max(real_err, diff);
 
       diff = std::abs(expected_imag - got_imag);
       imag_err = std::max(imag_err, diff);
+    }
 
-      // if (i < 8) {
-      //   printf("%f => %f\t%f => %f\n", expected_real, got_real,
-      //   expected_imag,
-      //          got_imag);
-      // }
+    if (rep % 10 == 0) {
+      printf("until %d: max simd error %f %f\n", rep, real_err, imag_err);
     }
   }
 

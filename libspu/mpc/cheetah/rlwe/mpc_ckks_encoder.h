@@ -7,6 +7,8 @@
 
 namespace seal::util {
 
+// NOTE(lwj): we perform local truncation for fixed-point mul during
+// the FFT matrix evaluation.
 #define DEF_ARITH(TT)                                                   \
   template <>                                                           \
   class Arithmetic<std::complex<TT>, std::complex<TT>, TT> {            \
@@ -138,6 +140,28 @@ class MPCCKKSEncoder {
 
     mpc_arith_ = MPCArith(fxp_);
     fft_handler_ = FFTHandler(mpc_arith_);
+  }
+
+  void encode_complex(absl::Span<const value_t> input,
+                      absl::Span<scalar_t> destination) const {
+    const size_t n = slots_ * 2;
+    SPU_ENFORCE_EQ(input.size(), slots_);
+    SPU_ENFORCE_EQ(destination.size(), n);
+
+    auto conj =
+        seal::util::allocate<value_t>(n, seal::MemoryManager::GetPool(), 0);
+
+    for (size_t i = 0; i < slots_; ++i) {
+      conj[matrix_reps_index_map_[i]] = input[i];
+      conj[matrix_reps_index_map_[i + slots_]] = std::conj(input[i]);
+    }
+
+    scalar_t fix = EncodeToFxp<scalar_t>(1. / n, fxp_);
+    fft_handler_.transform_from_rev(conj.get(), seal::util::get_power_of_two(n),
+                                    inv_root_powers_.data(), &fix);
+    for (size_t i = 0; i < n; ++i) {
+      destination[i] = conj[i].real();
+    }
   }
 
   void encode(absl::Span<const scalar_t> input,
