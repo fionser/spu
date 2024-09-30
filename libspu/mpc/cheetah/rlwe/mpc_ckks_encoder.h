@@ -1,10 +1,13 @@
 #pragma once
 #include <complex>
 
+#include "Eigen/Sparse"
 #include "absl/types/span.h"
 #include "seal/util/croots.h"
 #include "seal/util/dwthandler.h"
 
+using C64 = std::complex<double>;
+using C64Mat = Eigen::SparseMatrix<C64>;
 namespace seal::util {
 
 // NOTE(lwj): we perform local truncation for fixed-point mul during
@@ -89,6 +92,21 @@ class MPCCKKSEncoder {
   using C64_FFTHandler = seal::util::DWTHandler<std::complex<double>,
                                                 std::complex<double>, double>;
 
+  std::complex<double> exp_c64(std::complex<double> base, uint64_t exp) {
+    std::complex<double> result = 1;
+
+    while (exp > 0) {
+      // If exp is odd, multiply the current result by base
+      if (exp % 2 == 1) {
+        result = result * base;
+      }
+      base = base * base;
+      // Divide exp by 2
+      exp >>= 1;
+    }
+    return result;
+  }
+
   MPCCKKSEncoder(int fxp, size_t degree) : fxp_(fxp) {
     SPU_ENFORCE(absl::has_single_bit(degree));
     SPU_ENFORCE(degree > 4);
@@ -140,6 +158,67 @@ class MPCCKKSEncoder {
 
     mpc_arith_ = MPCArith(fxp_);
     fft_handler_ = FFTHandler(mpc_arith_);
+
+    decode_mat_.resize(slots_ * degree);
+    encode_mat_.resize(degree * slots_);
+
+    uint64_t gen_pow = 1;
+    // V[r, c] = w^{5^r * c}
+    // invV = 1/N * conj(V^T)
+    for (size_t r = 0; r < slots_; r++) {
+      for (size_t c = 0; c < degree; c++) {
+        // V[r, c] = w^{5^r * c}
+        auto v = complex_roots.get_root((gen_pow * c) & (m - 1));
+        decode_mat_[r * degree + c].real(EncodeToFxp<scalar_t>(v.real(), fxp_));
+        decode_mat_[r * degree + c].imag(EncodeToFxp<scalar_t>(v.imag(), fxp_));
+
+        // transpose V^T
+        encode_mat_[c * slots_ + r].real(EncodeToFxp<scalar_t>(v.real(), fxp_));
+        encode_mat_[c * slots_ + r].imag(EncodeToFxp<scalar_t>(v.imag(), fxp_));
+      }
+
+      gen_pow *= gen;
+      gen_pow &= (m - 1);
+    }
+
+#if 0
+    // To test V * invV is identity matrix
+    for (size_t i = 0; i < slots_; i++) {
+      for (size_t j = 0; j < slots_; j++) {
+        root_t tmp0 = 0;
+        for (size_t k = 0; k < degree; k++) {
+          tmp0 += decode_mat_[i * degree + k] * encode_mat_[k * slots_ + j];
+        }
+        printf("%f + %f ", DecodeFromFxp<scalar_t>(tmp0.real(), 2 * fxp_),
+               DecodeFromFxp<scalar_t>(tmp0.imag(), 2 * fxp_));
+      }
+      printf("\n");
+    }
+#endif
+  }
+
+  // FIXME(lwj): encode_complex_new is not mixing with encode_complex
+  void encode_complex_new(absl::Span<const value_t> input,
+                          absl::Span<scalar_t> destination) const {
+    const size_t n = slots_ * 2;
+    size_t logn = std::log2(n);
+    SPU_ENFORCE_EQ(input.size(), slots_);
+    SPU_ENFORCE_EQ(destination.size(), n);
+
+    // Ref https://eprint.iacr.org/2018/153.pdf
+    // Section 4.1 Packing Method
+    using ST = typename std::make_signed<scalar_t>::type;
+    for (size_t r = 0; r < n; r++) {
+      scalar_t tmp = 0;
+      // By definition, m(X) = V * conj(v) + conj(V) * v
+      for (size_t c = 0; c < slots_; c++) {
+        tmp += 2 * encode_mat_[r * slots_ + c].real() * input[c].real();
+        tmp += 2 * encode_mat_[r * slots_ + c].imag() * input[c].imag();
+      }
+
+      destination[r] =
+          static_cast<scalar_t>(static_cast<ST>(tmp) >> (fxp_ + logn));
+    }
   }
 
   void encode_complex(absl::Span<const value_t> input,
@@ -210,6 +289,27 @@ class MPCCKKSEncoder {
     }
   }
 
+  void decode_complex_new(absl::Span<const scalar_t> input,
+                          absl::Span<scalar_t> real_dest,
+                          absl::Span<scalar_t> imag_dest) const {
+    const size_t n = slots_ * 2;
+    SPU_ENFORCE_EQ(input.size(), n);
+    SPU_ENFORCE_EQ(real_dest.size(), slots_);
+    SPU_ENFORCE_EQ(imag_dest.size(), slots_);
+    using ST = typename std::make_signed<scalar_t>::type;
+    // V * input
+    for (size_t r = 0; r < slots_; ++r) {
+      root_t tmp = 0;
+      for (size_t c = 0; c < n; ++c) {
+        tmp += decode_mat_[r * n + c] * input[c];
+      }
+      real_dest[r] =
+          static_cast<scalar_t>(static_cast<ST>(tmp.real()) >> (fxp_));
+      imag_dest[r] =
+          static_cast<scalar_t>(static_cast<ST>(tmp.imag()) >> (fxp_));
+    }
+  }
+
   void decode(absl::Span<const scalar_t> input,
               absl::Span<scalar_t> destination) const {
     const size_t n = slots_ * 2;
@@ -235,6 +335,9 @@ class MPCCKKSEncoder {
   int fxp_;
   size_t slots_;
   std::vector<std::size_t> matrix_reps_index_map_;
+
+  std::vector<root_t> encode_mat_;
+  std::vector<root_t> decode_mat_;
 
   std::vector<root_t> root_powers_;
   std::vector<root_t> inv_root_powers_;

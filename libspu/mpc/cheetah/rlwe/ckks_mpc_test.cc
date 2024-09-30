@@ -469,7 +469,7 @@ int main_back() {
   const size_t nslots = poly_N / 2;
   const int scale = 30;
   const int mpc_fxp = 12;
-  const int fft_fxp = std::log2(poly_N) + 12;  // mpc_fxp;
+  const int fft_fxp = std::log2(poly_N) + 14;  // mpc_fxp;
 
   using mpc_t = uint32_t;
   using signed_t = std::make_signed<mpc_t>::type;
@@ -988,6 +988,7 @@ void ConvToMPC(absl::Span<const double> real, absl::Span<T> shr0,
                absl::Span<T> shr1, int fxp) {
   std::default_random_engine rdv(std::time(0));
   std::uniform_int_distribution<T> mpc_uniform(0, static_cast<T>(-1));
+  // std::uniform_int_distribution<T> mpc_uniform(0, static_cast<T>(1000000));
   size_t nsize = real.size();
   for (size_t i = 0; i < nsize; ++i) {
     shr0[i] = mpc_uniform(rdv);
@@ -995,6 +996,119 @@ void ConvToMPC(absl::Span<const double> real, absl::Span<T> shr0,
   }
 }
 
+#include "seal/util/common.h"
+#include "seal/util/ntt.h"
+#include "seal/util/polyarithsmallmod.h"
+
+uint64_t exp_uint_mod(uint64_t base, uint64_t exp, const seal::Modulus& p) {
+  uint64_t result = 1;
+  base = seal::util::barrett_reduce_64(base, p);
+
+  while (exp > 0) {
+    // If exp is odd, multiply the current result by base
+    if (exp % 2 == 1) {
+      result = seal::util::multiply_uint_mod(result, base, p);
+    }
+    base = seal::util::multiply_uint_mod(base, base, p);
+
+    // Divide exp by 2
+    exp >>= 1;
+  }
+  return result;
+}
+
+int test_ntt() {
+  int log2n = 5;
+  int n = 1L << log2n;
+  auto prime = seal::util::get_prime(2 * n, 12);
+  seal::util::NTTTables tbl(log2n, prime);
+
+  std::vector<uint64_t> Vmat(n * n);
+  std::vector<uint64_t> inv_Vmat(n * n);
+  uint64_t root = tbl.get_root();
+  root = seal::util::multiply_uint_mod(root, root, prime);
+  uint64_t inv_root;
+  seal::util::try_invert_uint_mod(root, prime, inv_root);
+
+  [[maybe_unused]] constexpr int g = 5;
+
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < n; ++c) {
+      // phi^{c} * w^{r * c} mod p
+      Vmat[r * n + c] = exp_uint_mod(root, r * c, prime);
+
+      int rc = seal::util::reverse_bits<uint32_t>(c, log2n);
+      Vmat[r * n + c] = seal::util::multiply_uint_mod(
+          Vmat[r * n + c], tbl.get_from_root_powers()[rc], prime);
+
+      rc = seal::util::reverse_bits<uint32_t>(r - 1, log2n) + 1;
+      if (r == 0) {
+        rc = 0;
+      }
+      // n^{-1} * phi^{-c} * w^{-r * c} mod p
+      inv_Vmat[r * n + c] = exp_uint_mod(inv_root, r * c, prime);
+      inv_Vmat[r * n + c] = seal::util::multiply_uint_mod(
+          inv_Vmat[r * n + c], tbl.get_from_inv_root_powers()[rc], prime);
+      inv_Vmat[r * n + c] = seal::util::multiply_uint_mod(
+          inv_Vmat[r * n + c], tbl.inv_degree_modulo(), prime);
+    }
+  }
+
+  std::vector<uint64_t> inputs(n);
+  std::uniform_int_distribution<uint64_t> uniform(0, prime.value() - 1);
+  std::default_random_engine rdv;
+  std::generate_n(inputs.begin(), inputs.size(),
+                  [&]() { return uniform(rdv); });
+
+  // forward
+  std::vector<uint64_t> outputs(n);
+  for (int r = 0; r < n; ++r) {
+    uint64_t tmp = 0;
+    for (int c = 0; c < n; ++c) {
+      tmp = seal::util::multiply_add_uint_mod(inputs[c], Vmat[r * n + c], tmp,
+                                              prime);
+    }
+    outputs[r] = tmp;
+  }
+
+  // backward
+  std::vector<uint64_t> inv_outputs(n);
+  for (int r = 0; r < n; ++r) {
+    uint64_t tmp = 0;
+    for (int c = 0; c < n; ++c) {
+      tmp = seal::util::multiply_add_uint_mod(outputs[c], inv_Vmat[r * n + c],
+                                              tmp, prime);
+    }
+    inv_outputs[r] = tmp;
+  }
+
+  printf("check forward(x) = bitrev(ntt(x))\nexpected:\n");
+  seal::util::ntt_negacyclic_harvey(inputs.data(), tbl);
+  for (int r = 0; r < n; ++r) {
+    int ri = seal::util::reverse_bits<uint32_t>(r, log2n);
+    printf("%llu ", inputs[ri]);
+  }
+  printf("\n");
+  printf("got:\n");
+  for (int r = 0; r < n; ++r) {
+    printf("%llu ", outputs[r]);
+  }
+  printf("\n");
+
+  printf("\ncheck backward(forward(x)) = intt(ntt(x))\nexpected:\n");
+  seal::util::inverse_ntt_negacyclic_harvey(inputs.data(), tbl);
+  for (int r = 0; r < n; ++r) {
+    printf("%llu ", inputs[r]);
+  }
+  printf("\n");
+  printf("got:\n");
+  for (int r = 0; r < n; ++r) {
+    printf("%llu ", inv_outputs[r]);
+  }
+  printf("\n");
+
+  return 0;
+}
 /**
  * To run this demo, we need to modify the SEAL's codes
  *
@@ -1006,20 +1120,20 @@ void ConvToMPC(absl::Span<const double> real, absl::Span<T> shr0,
  *
  * */
 int main() {
-  const size_t poly_N = 8192;
+  const size_t poly_N = 16;
   const size_t nslots = poly_N / 2;
   const double apprx_range = 4.0;
 
   const int mpc_fxp = 20;
-  const int fft_fxp = std::log2(poly_N) + 12;
+  const int fft_fxp = std::log2(poly_N) + 16;
   const int scale = 28;
 
   using mpc_t = uint64_t;
   // NOTE(lwj): we need to peform the local CKKS encoding in a larger ring size.
-  using dmpc_t = uint128_t;
+  using dmpc_t = uint64_t;
   size_t mpc_width = 8 * sizeof(mpc_t);
 
-  std::vector<int> modulus_bits = {50, 40, 2 * scale, 60};
+  std::vector<int> modulus_bits = {40, 30, 2 * scale, 60};
 
   printf("Q = %dbits\n",
          std::accumulate(modulus_bits.begin(), modulus_bits.end() - 1, 0));
@@ -1100,10 +1214,12 @@ int main() {
     std::vector<dmpc_t> dmpc_poly_coeff0(poly_N);
     std::vector<dmpc_t> dmpc_poly_coeff1(poly_N);
     // local CKKS encoding over the MPC modulus 2^k
-    dmpc_ckks_decoder.encode_complex(absl::MakeConstSpan(compx_mpc_vec0),
-                                     absl::MakeSpan(dmpc_poly_coeff0));
-    dmpc_ckks_decoder.encode_complex(absl::MakeConstSpan(compx_mpc_vec1),
-                                     absl::MakeSpan(dmpc_poly_coeff1));
+    // NOTE(lwj): Due to some unknown issues, we can not mix the two kinds of
+    // encoding implementation
+    dmpc_ckks_decoder.encode_complex_new(absl::MakeConstSpan(compx_mpc_vec0),
+                                         absl::MakeSpan(dmpc_poly_coeff0));
+    dmpc_ckks_decoder.encode_complex_new(absl::MakeConstSpan(compx_mpc_vec1),
+                                         absl::MakeSpan(dmpc_poly_coeff1));
     // ring change from u128 to u64
     std::transform(dmpc_poly_coeff0.begin(), dmpc_poly_coeff0.end(),
                    mpc_poly_coeff0.data(),
@@ -1194,13 +1310,14 @@ int main() {
     std::vector<mpc_t> mpc_imag1(nslots);
 
     // Alice local decoding
-    mpc_ckks_decoder.decode_complex(absl::MakeSpan(mpc0),
-                                    absl::MakeSpan(mpc_real0),
-                                    absl::MakeSpan(mpc_imag0));
+    // NOTE(lwj): We can mix the decoding function
+    mpc_ckks_decoder.decode_complex_new(absl::MakeSpan(mpc0),
+                                        absl::MakeSpan(mpc_real0),
+                                        absl::MakeSpan(mpc_imag0));
     // Bob local decoding
-    mpc_ckks_decoder.decode_complex(absl::MakeSpan(mpc1),
-                                    absl::MakeSpan(mpc_real1),
-                                    absl::MakeSpan(mpc_imag1));
+    mpc_ckks_decoder.decode_complex_new(absl::MakeSpan(mpc1),
+                                        absl::MakeSpan(mpc_real1),
+                                        absl::MakeSpan(mpc_imag1));
     // Correctness check
     [[maybe_unused]] auto gelu_func = [](double x) {
       return 0.5 * x *
@@ -1226,7 +1343,7 @@ int main() {
       imag_err = std::max(imag_err, diff);
     }
 
-    if (rep % 10 == 0) {
+    if (rep % 100 == 0) {
       printf("until %d: max simd error %f %f\n", rep, real_err, imag_err);
     }
   }
